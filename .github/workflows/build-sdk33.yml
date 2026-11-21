@@ -1,0 +1,138 @@
+name: Build Android SDK 33 APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      min_sdk:
+        description: 'Target minSdk version'
+        required: true
+        default: '33'
+      run_copy_devtools:
+        description: 'Run ./scripts/copy-devtools.sh before building'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+
+      - name: Patch minSdk in app Gradle config
+        env:
+          MIN_SDK: ${{ inputs.min_sdk || '33' }}
+        run: |
+          python3 - <<'PY'
+          import os, re, pathlib
+
+          candidates = [pathlib.Path("app/build.gradle.kts"), pathlib.Path("app/build.gradle")]
+          gradle_file = next((p for p in candidates if p.exists()), None)
+          if not gradle_file:
+              raise SystemExit("Neither app/build.gradle.kts nor app/build.gradle was found.")
+
+          text = gradle_file.read_text()
+          min_sdk = os.environ["MIN_SDK"]
+          replacement = f"minSdk = {min_sdk}" if gradle_file.suffix == ".kts" else f"minSdk {min_sdk}"
+
+          new_text, count = re.subn(
+              r'minSdk(?:Version)?\s*(?:=|\(|\s)\s*\d+\)?',
+              replacement,
+              text,
+          )
+          if count == 0:
+              print("--- app Gradle file contents ---")
+              print(text)
+              raise SystemExit("Could not find a numeric minSdk declaration to patch.")
+
+          gradle_file.write_text(new_text)
+          PY
+          git diff app/
+
+      - name: Check DevTools assets
+        run: |
+          if [ "${{ inputs.run_copy_devtools }}" = "true" ]; then
+            chmod +x ./scripts/copy-devtools.sh
+            ./scripts/copy-devtools.sh
+          elif [ ! -d "app/src/main/assets" ] || [ -z "$(ls -A app/src/main/assets 2>/dev/null)" ]; then
+            echo "::warning::app/src/main/assets is empty or missing. Printing scripts/copy-devtools.sh:"
+            cat scripts/copy-devtools.sh || true
+          else
+            echo "Found bundled assets in app/src/main/assets:"
+            ls -la app/src/main/assets
+          fi
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Run Android Lint (NewApi check)
+        continue-on-error: true
+        run: ./gradlew :app:lintDebug --no-daemon --stacktrace
+
+      - name: Summarize NewApi lint findings
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, xml.etree.ElementTree as ET
+
+          summary = pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"])
+          xml_files = list(pathlib.Path("app/build/reports").glob("lint-results-*.xml"))
+          if not xml_files:
+              summary.write_text("### Lint Check\nNo lint XML report was generated. Inspect the `Run Android Lint` log.\n")
+              raise SystemExit(0)
+
+          root = ET.parse(xml_files[0]).getroot()
+          issues = [i for i in root.findall("issue") if i.attrib.get("id") in ("NewApi", "InlinedApi")]
+
+          lines = ["### Android API 33 Compatibility Check (`NewApi`)"]
+          if not issues:
+              lines.append("**0 `NewApi` issues found.** No API 34/35-only calls were detected.")
+          else:
+              lines.append(f"Found **{len(issues)}** API compatibility issue(s) to guard:\n")
+              for issue in issues:
+                  loc = issue.find("location")
+                  file_path = loc.attrib.get("file", "unknown") if loc is not None else "unknown"
+                  line_no = loc.attrib.get("line", "?") if loc is not None else "?"
+                  msg = issue.attrib.get("message", "")
+                  lines.append(f"- `{file_path}:{line_no}` — {msg}")
+
+          output = "\n".join(lines) + "\n"
+          summary.write_text(output)
+          print(output)
+          PY
+
+      - name: Build Debug APK
+        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Verify built APK minSdk
+        run: |
+          APK=$(find app/build/outputs/apk/debug -name "*.apk" | head -n 1)
+          echo "Built APK: $APK"
+          AAPT2=$(find "$ANDROID_HOME/build-tools" -name "aapt2" | sort -V | tail -n 1)
+          "$AAPT2" dump badging "$APK" | grep -E "package:|sdkVersion:|targetSdkVersion:"
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: developer-tools-sdk33-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload Lint Report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: lint-report
+          path: app/build/reports/lint-results-debug.*
+          if-no-files-found: ignore
