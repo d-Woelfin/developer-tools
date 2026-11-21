@@ -60,6 +60,13 @@ jobs:
           PY
           git diff app/
 
+      - name: Remove hardcoded macOS java.home from gradle.properties
+        run: |
+          if [ -f gradle.properties ]; then
+            sed -i '/^[[:space:]]*org\.gradle\.java\.home[[:space:]]*=/d' gradle.properties
+            git diff gradle.properties
+          fi
+
       - name: Check DevTools assets
         run: |
           if [ "${{ inputs.run_copy_devtools }}" = "true" ]; then
